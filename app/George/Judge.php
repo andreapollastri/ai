@@ -5,6 +5,7 @@ namespace App\George;
 use App\George\Contracts\Reasoner;
 use App\George\Support\Distributions;
 use App\George\Support\Language;
+use App\George\Support\Primer;
 use App\George\Support\Prompt;
 
 /**
@@ -43,6 +44,7 @@ final class Judge
                 'model' => $this->reasoner->modelName(),
                 'engine' => $this->reasoner->driver(),
                 'calibrated' => false,
+                'primer' => Primer::enabled(),
                 'temperature' => 1.0,
                 'locale' => 'en',
                 'english_warning' => Language::looksItalian($situation),

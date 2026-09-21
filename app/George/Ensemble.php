@@ -3,6 +3,7 @@
 namespace App\George;
 
 use App\George\Engines\TransformersEngine;
+use App\George\Reasoners\LlamaReasoner;
 use App\George\Reasoners\TransformersReasoner;
 use App\George\Support\TemperatureScaler;
 use App\Jobs\EvaluateSlot;
@@ -25,6 +26,8 @@ final class Ensemble
 {
     public const SLOTS = ['a', 'b', 'c'];
 
+    private static ?LlamaReasoner $llama = null;
+
     public static function configured(): bool
     {
         return (bool) config('george.ensemble')
@@ -34,8 +37,26 @@ final class Ensemble
 
     public static function reasonerConfigured(): bool
     {
-        return (bool) config('george.reasoner')
-            && filled(config('george.reasoner_model'));
+        if (! (bool) config('george.reasoner')) {
+            return false;
+        }
+
+        return self::reasonerBackend() === 'llama'
+            ? filled(config('george.llama.url'))
+            : filled(config('george.reasoner_model'));
+    }
+
+    /**
+     * Where slot C runs: onnx (TransformersPHP in this process) or llama
+     * (llama-server over HTTP). Anything else is a typo, and a typo that
+     * silently disabled the reasoner would be worse than one that falls
+     * back to the in-process default.
+     */
+    public static function reasonerBackend(): string
+    {
+        $backend = strtolower(trim((string) config('george.reasoner_backend', 'onnx')));
+
+        return $backend === 'llama' ? 'llama' : 'onnx';
     }
 
     /**
@@ -82,18 +103,51 @@ final class Ensemble
 
     public static function slotIsCached(string $slot): bool
     {
-        return $slot === 'c'
-            ? TransformersReasoner::modelIsCached(self::model('c'))
-            : TransformersEngine::modelIsCached(self::model($slot));
+        if ($slot !== 'c') {
+            return TransformersEngine::modelIsCached(self::model($slot));
+        }
+
+        // Weights on disk for the in-process backend; a socket that
+        // answers for llama-server, which holds its own.
+        return self::reasonerBackend() === 'llama'
+            ? self::llama()->isReady()
+            : TransformersReasoner::modelIsCached((string) config('george.reasoner_model'));
     }
 
     public static function model(string $slot): string
     {
         return match ($slot) {
             'b' => (string) config('george.model_b'),
-            'c' => (string) config('george.reasoner_model'),
+            'c' => self::reasonerBackend() === 'llama'
+                ? self::llamaLabel()
+                : (string) config('george.reasoner_model'),
             default => (string) config('george.model'),
         };
+    }
+
+    /**
+     * What the llama unit was told to serve. The live name comes from the
+     * server itself once slot C runs; this is what to print before that.
+     */
+    private static function llamaLabel(): string
+    {
+        $repo = trim((string) config('george.llama.repo', ''));
+        $quant = trim((string) config('george.llama.quant', ''));
+
+        if ($repo === '') {
+            return 'llama-server';
+        }
+
+        return $quant === '' ? $repo : $repo.':'.$quant;
+    }
+
+    /**
+     * One probe per process. Readiness is read several times per request
+     * and the instance keeps the health check short-lived but shared.
+     */
+    private static function llama(): LlamaReasoner
+    {
+        return self::$llama ??= new LlamaReasoner;
     }
 
     /**
@@ -284,12 +338,14 @@ final class Ensemble
         $passes = 0;
         $englishWarning = false;
         $tokenWarning = false;
+        $primer = false;
 
         foreach ($bySlot as $slot => $result) {
             $models[] = (string) ($result['meta']['model'] ?? self::model($slot));
             $passes += (int) ($result['meta']['forward_passes'] ?? 0);
             $englishWarning = $englishWarning || (bool) ($result['meta']['english_warning'] ?? false);
             $tokenWarning = $tokenWarning || (bool) ($result['meta']['token_warning'] ?? false);
+            $primer = $primer || (bool) ($result['meta']['primer'] ?? false);
         }
 
         return [
@@ -301,6 +357,7 @@ final class Ensemble
                 'slots' => array_keys($bySlot),
                 'weights' => array_map(fn (float $w): float => round($w, 3), $weights),
                 'reasoner' => isset($bySlot['c']),
+                'primer' => $primer,
                 'calibrated' => false,
                 'temperature' => $first['meta']['temperature'] ?? 1.0,
                 'locale' => $first['meta']['locale'] ?? 'en',

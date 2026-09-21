@@ -41,10 +41,16 @@ class GeorgeDownloadCommand extends Command
         }
 
         if (! $this->argument('model') && ! $this->option('skip-reasoner') && Ensemble::reasonerConfigured()) {
-            $status = $this->downloadReasoner($cacheDir);
+            if (Ensemble::reasonerBackend() === 'llama') {
+                // llama-server fetches its own GGUF from `-hf repo:quant`
+                // on first boot. Pulling it here would only duplicate it.
+                $this->components->info('Slot C is on llama-server; it downloads its own weights.');
+            } else {
+                $status = $this->downloadReasoner($cacheDir);
 
-            if ($status !== self::SUCCESS) {
-                return $status;
+                if ($status !== self::SUCCESS) {
+                    return $status;
+                }
             }
         }
 

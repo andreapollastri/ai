@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\George\Contracts\Engine;
 use App\George\Ensemble;
+use App\George\Support\Primer;
 use App\Http\Requests\EvaluateRequest;
 use App\Jobs\EvaluateSituation;
 use App\Models\Evaluation;
@@ -77,6 +78,7 @@ class EvaluateController extends Controller
             'ensemble' => $ensemble,
             'slots' => $ensemble ? $slots : ['a'],
             'reasoner' => $ensemble && in_array('c', $slots, true),
+            'primer' => Primer::enabled(),
             'ready' => $ensemble || $engine->isReady(),
             'driver' => config('george.driver'),
             'calibrated' => false,

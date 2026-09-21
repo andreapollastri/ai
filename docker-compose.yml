@@ -9,6 +9,8 @@ services:
       GEORGE_ENGINE: transformers
       GEORGE_DRIVER: queue
       GEORGE_ENSEMBLE: "true"
+      GEORGE_REASONER_BACKEND: ${GEORGE_REASONER_BACKEND:-onnx}
+      GEORGE_LLAMA_URL: http://reasoner:8080
       QUEUE_CONNECTION: database
     volumes:
       - george-models:/app/storage/app/george-models
@@ -59,6 +61,10 @@ services:
       GEORGE_DRIVER: queue
       GEORGE_ENSEMBLE: "true"
       GEORGE_REASONER: "true"
+      GEORGE_REASONER_BACKEND: ${GEORGE_REASONER_BACKEND:-onnx}
+      GEORGE_LLAMA_URL: http://reasoner:8080
+      GEORGE_LLAMA_REPO: ${GEORGE_LLAMA_REPO:-Qwen/Qwen3-8B-GGUF}
+      GEORGE_LLAMA_QUANT: ${GEORGE_LLAMA_QUANT:-Q4_K_M}
       QUEUE_CONNECTION: database
     volumes:
       - george-models:/app/storage/app/george-models
@@ -67,6 +73,22 @@ services:
     depends_on:
       - app
 
+  # Slot C on llama.cpp instead of in-process ONNX:
+  #   GEORGE_REASONER_BACKEND=llama docker compose --profile llama up
+  # The server downloads its own GGUF into the llama-models volume.
+  reasoner:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    profiles: ["llama"]
+    environment:
+      LLAMA_CACHE: /models
+    volumes:
+      - llama-models:/models
+    command: >
+      --host 0.0.0.0 --port 8080
+      -hf ${GEORGE_LLAMA_REPO:-Qwen/Qwen3-8B-GGUF}:${GEORGE_LLAMA_QUANT:-Q4_K_M}
+      --ctx-size 4096 --parallel 1 --cache-reuse 256
+
 volumes:
   george-models:
   george-db:
+  llama-models:

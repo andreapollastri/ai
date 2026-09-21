@@ -68,21 +68,54 @@ final class Prompt
      *   chatml_plain   Qwen2.5 and other ChatML models with no thinking mode
      *   phi3           Phi-3 / Phi-3.5
      *   llama3         Llama 3.x instruct
+     *
+     * @param  list<array{user: string, assistant: string}>  $shots
      */
-    public static function chat(string $system, string $user, string $format = 'chatml'): string
+    public static function chat(string $system, string $user, string $format = 'chatml', array $shots = []): string
+    {
+        $format = in_array($format, self::FORMATS, true) ? $format : 'chatml';
+        $out = self::open($system, $format);
+
+        foreach ($shots as $shot) {
+            $out .= self::done((string) ($shot['user'] ?? ''), (string) ($shot['assistant'] ?? ''), $format);
+        }
+
+        return $out.self::ask($user, $format);
+    }
+
+    private static function open(string $system, string $format): string
     {
         return match ($format) {
-            'phi3' => '<|system|>'."\n".$system.'<|end|>'."\n"
-                .'<|user|>'."\n".$user.'<|end|>'."\n"
+            'phi3' => '<|system|>'."\n".$system.'<|end|>'."\n",
+            'llama3' => '<|begin_of_text|><|start_header_id|>system<|end_header_id|>'."\n\n".$system.'<|eot_id|>',
+            default => '<|im_start|>system'."\n".$system.'<|im_end|>'."\n",
+        };
+    }
+
+    private static function done(string $user, string $assistant, string $format): string
+    {
+        $letter = strtoupper(substr(trim($assistant), 0, 1));
+
+        return match ($format) {
+            'phi3' => '<|user|>'."\n".$user.'<|end|>'."\n"
+                .'<|assistant|>'."\n".$letter.'<|end|>'."\n",
+            'llama3' => '<|start_header_id|>user<|end_header_id|>'."\n\n".$user.'<|eot_id|>'
+                .'<|start_header_id|>assistant<|end_header_id|>'."\n\n".$letter.'<|eot_id|>',
+            default => '<|im_start|>user'."\n".$user.'<|im_end|>'."\n"
+                .'<|im_start|>assistant'."\n".$letter.'<|im_end|>'."\n",
+        };
+    }
+
+    private static function ask(string $user, string $format): string
+    {
+        return match ($format) {
+            'phi3' => '<|user|>'."\n".$user.'<|end|>'."\n"
                 .'<|assistant|>'."\n",
-            'llama3' => '<|begin_of_text|><|start_header_id|>system<|end_header_id|>'."\n\n".$system.'<|eot_id|>'
-                .'<|start_header_id|>user<|end_header_id|>'."\n\n".$user.'<|eot_id|>'
+            'llama3' => '<|start_header_id|>user<|end_header_id|>'."\n\n".$user.'<|eot_id|>'
                 .'<|start_header_id|>assistant<|end_header_id|>'."\n\n",
-            'chatml_plain' => '<|im_start|>system'."\n".$system.'<|im_end|>'."\n"
-                .'<|im_start|>user'."\n".$user.'<|im_end|>'."\n"
+            'chatml_plain' => '<|im_start|>user'."\n".$user.'<|im_end|>'."\n"
                 .'<|im_start|>assistant'."\n",
-            default => '<|im_start|>system'."\n".$system.'<|im_end|>'."\n"
-                .'<|im_start|>user'."\n".$user.'<|im_end|>'."\n"
+            default => '<|im_start|>user'."\n".$user.'<|im_end|>'."\n"
                 .'<|im_start|>assistant'."\n"
                 ."<think>\n\n</think>\n\n",
         };

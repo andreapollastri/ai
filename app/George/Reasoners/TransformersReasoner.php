@@ -2,7 +2,7 @@
 
 namespace App\George\Reasoners;
 
-use App\George\Contracts\Reasoner;
+use App\George\Support\Primer;
 use App\George\Support\Prompt;
 use App\George\Support\Softmax;
 use Codewithkyrian\Transformers\Models\Auto\AutoModelForCausalLM;
@@ -12,10 +12,16 @@ use Codewithkyrian\Transformers\Utils\ImageDriver;
 use RuntimeException;
 
 /**
- * A ChatML instruct model read through the next-token logits over the
- * option letters. No generation: one forward pass per prompt.
+ * Slot C in-process: TransformersPHP loads the ONNX graph into this PHP
+ * process and the readout is one forward pass, no generation.
+ *
+ * The ceiling is the runtime, not the machine. The binding has no float16
+ * tensor mapping, so the build needs a float32 KV cache (q4 / int8 /
+ * quantized), and the larger repos ship either q4f16 only or an ONNX
+ * Runtime GenAI layout this library cannot open. In practice that stops
+ * at 4B; above it, use LlamaReasoner.
  */
-final class TransformersReasoner implements Reasoner
+final class TransformersReasoner extends LetterReasoner
 {
     private mixed $model = null;
 
@@ -26,59 +32,11 @@ final class TransformersReasoner implements Reasoner
 
     private bool $booted = false;
 
-    private int $lastPasses = 0;
-
-    private float $lastSpread = 0.0;
-
     public function __construct(
         private readonly ?string $modelName = null,
         private readonly ?string $file = null,
         private readonly ?string $format = null,
     ) {}
-
-    public function judge(string $situation, string $question, array $options): array
-    {
-        $options = array_values($options);
-        $n = count($options);
-
-        if ($n < 1 || $n > count(Prompt::LETTERS)) {
-            throw new RuntimeException('The reasoner takes between 1 and '.count(Prompt::LETTERS).' options.');
-        }
-
-        $this->load();
-        $this->lastPasses = 0;
-        $this->lastSpread = 0.0;
-
-        $forward = $this->readout($situation, $question, $options);
-
-        if (! (bool) config('george.reasoner_debias', true) || $n < 2) {
-            return $forward;
-        }
-
-        $reversed = array_reverse($this->readout($situation, $question, array_reverse($options)));
-
-        $averaged = [];
-        $l1 = 0.0;
-
-        foreach ($forward as $i => $p) {
-            $averaged[] = ($p + $reversed[$i]) / 2;
-            $l1 += abs($p - $reversed[$i]);
-        }
-
-        $this->lastSpread = min($l1 / 2, 1.0);
-
-        $sum = array_sum($averaged);
-
-        return $sum > 0
-            ? array_map(fn (float $p): float => $p / $sum, $averaged)
-            : array_fill(0, $n, 1 / $n);
-    }
-
-    public function warmup(): void
-    {
-        $this->load();
-        $this->judge('George is warming up.', 'Is George awake?', ['Yes. Awake', 'No. Asleep']);
-    }
 
     public function modelName(): string
     {
@@ -93,16 +51,6 @@ final class TransformersReasoner implements Reasoner
     public function isReady(): bool
     {
         return self::modelIsCached($this->modelName(), $this->fileName());
-    }
-
-    public function lastPasses(): int
-    {
-        return $this->lastPasses;
-    }
-
-    public function lastSpread(): float
-    {
-        return $this->lastSpread;
     }
 
     public static function modelIsCached(?string $model = null, ?string $file = null, ?string $cacheDir = null): bool
@@ -132,9 +80,11 @@ final class TransformersReasoner implements Reasoner
      * @param  list<string>  $options
      * @return list<float>
      */
-    private function readout(string $situation, string $question, array $options): array
+    protected function readout(string $situation, string $question, array $options): array
     {
-        $text = Prompt::chat(Prompt::SYSTEM, Prompt::user($situation, $question, $options), $this->format());
+        $system = Primer::enabled() ? Primer::system() : Prompt::SYSTEM;
+        $shots = Primer::enabled() ? Primer::shots() : [];
+        $text = Prompt::chat($system, Prompt::user($situation, $question, $options), $this->format(), $shots);
 
         $encoded = ($this->tokenizer)($text, addSpecialTokens: false, returnTensor: true);
 
@@ -143,7 +93,7 @@ final class TransformersReasoner implements Reasoner
             'attention_mask' => $encoded['attention_mask'],
         ]);
 
-        $this->lastPasses++;
+        $this->countPass();
 
         $logits = $output['logits'];
         $shape = $logits->shape();
@@ -174,12 +124,10 @@ final class TransformersReasoner implements Reasoner
 
     private function format(): string
     {
-        $format = $this->format ?? (string) config('george.reasoner_format', 'chatml');
-
-        return in_array($format, Prompt::FORMATS, true) ? $format : 'chatml';
+        return $this->chatFormat($this->format ?? (string) config('george.reasoner_format', 'chatml'));
     }
 
-    private function load(): void
+    protected function prepare(): void
     {
         if ($this->model !== null) {
             return;

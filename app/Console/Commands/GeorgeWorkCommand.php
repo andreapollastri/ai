@@ -16,7 +16,8 @@ class GeorgeWorkCommand extends Command
         {--tries=1 : Number of times to attempt a job}
         {--timeout=180 : Seconds a child process can run}
         {--memory=4096 : Memory limit in megabytes}
-        {--sleep=1 : Seconds to wait when no job is available}';
+        {--sleep=1 : Seconds to wait when no job is available}
+        {--wait=1800 : Seconds slot C waits for llama-server before giving up}';
 
     public function handle(EngineFactory $factory): int
     {
@@ -51,6 +52,10 @@ class GeorgeWorkCommand extends Command
     {
         ini_set('memory_limit', ((int) $this->option('memory')).'M');
 
+        if ($slot === 'c' && Ensemble::reasonerBackend() === 'llama') {
+            $this->waitForLlama();
+        }
+
         $runner = $slot === 'c' ? $factory->makeReasoner() : $factory->make();
 
         $this->components->info('Loading '.$runner->modelName().' ('.$runner->driver().') on '.config('george.queue').'…');
@@ -71,6 +76,35 @@ class GeorgeWorkCommand extends Command
     }
 
     /**
+     * On first boot llama-server spends minutes downloading its GGUF. The
+     * factory would see a dead socket, hand back the keyword heuristic and
+     * keep it for the life of the worker, so wait here instead.
+     */
+    private function waitForLlama(): void
+    {
+        if (Ensemble::slotIsCached('c')) {
+            return;
+        }
+
+        $url = (string) config('george.llama.url');
+        $deadline = microtime(true) + (int) $this->option('wait');
+
+        $this->components->info("Waiting for llama-server at {$url}…");
+
+        while (microtime(true) < $deadline) {
+            sleep(10);
+
+            if (Ensemble::slotIsCached('c')) {
+                $this->components->info('llama-server is up.');
+
+                return;
+            }
+        }
+
+        $this->components->warn('llama-server never answered. Slot C falls back to the heuristic.');
+    }
+
+    /**
      * @param  list<string>  $slots
      */
     private function supervise(array $slots): int
@@ -83,6 +117,7 @@ class GeorgeWorkCommand extends Command
         $tries = (string) $this->option('tries');
         $timeout = (string) $this->option('timeout');
         $sleep = (string) $this->option('sleep');
+        $wait = (string) $this->option('wait');
 
         $command = fn (string $slot): array => [
             $php,
@@ -95,6 +130,7 @@ class GeorgeWorkCommand extends Command
             '--timeout='.$timeout,
             '--memory='.$memory,
             '--sleep='.$sleep,
+            '--wait='.$wait,
         ];
 
         $processes = [];

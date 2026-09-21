@@ -34,7 +34,8 @@ it('exposes engine status', function () {
     $this->get('/status')
         ->assertOk()
         ->assertJsonPath('engine', 'fake')
-        ->assertJsonPath('calibrated', false);
+        ->assertJsonPath('calibrated', false)
+        ->assertJsonPath('primer', true);
 });
 
 it('evaluates a typed situation', function () {

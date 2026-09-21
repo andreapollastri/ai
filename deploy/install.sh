@@ -29,12 +29,21 @@ APP_DIR="${APP_DIR:-/var/www/george}"
 APP_USER="${APP_USER:-george}"
 PHP_WANTED="${PHP_WANTED:-8.5}"          # falls back to 8.4, then 8.3
 REASONER="${REASONER:-auto}"             # auto | on | off — slot C, the LLM
+REASONER_BACKEND="${REASONER_BACKEND:-auto}"  # auto | onnx | llama
 ENSEMBLE="${ENSEMBLE:-auto}"             # auto | on | off — slot B, 2nd NLI head
 MODELS="${MODELS:-auto}"                 # auto | off     — background download
 SWAP="${SWAP:-auto}"                     # auto | off
 FIREWALL="${FIREWALL:-auto}"             # auto | off
 
-MIN_DISK_GB=8
+# Slot C on llama.cpp. Empty repo means "size it from the machine".
+LLAMA_REPO="${LLAMA_REPO:-}"             # e.g. Qwen/Qwen3-8B-GGUF
+LLAMA_QUANT="${LLAMA_QUANT:-Q4_K_M}"
+LLAMA_FORMAT="${LLAMA_FORMAT:-chatml}"   # chat layout George writes for it
+LLAMA_PORT="${LLAMA_PORT:-8080}"
+LLAMA_CTX="${LLAMA_CTX:-4096}"
+LLAMA_THREADS="${LLAMA_THREADS:-}"       # empty means cores minus one
+
+MIN_DISK_GB=12
 
 # ---------------------------------------------------------------- plumbing --
 
@@ -91,10 +100,37 @@ DISK_GB=$(df -BG --output=avail /var | tail -1 | tr -dc '0-9')
 info "Memory ${RAM_MB} MB, free disk on /var ${DISK_GB} GB"
 (( DISK_GB >= MIN_DISK_GB )) || die "Need ${MIN_DISK_GB} GB free on /var, found ${DISK_GB} GB."
 
-# Each NLI worker holds roughly 2 GB of weights and the reasoner roughly 4 GB.
-# Enabling more slots than the memory allows just gets them OOM-killed mid-job.
-[[ "$REASONER" == "auto" ]] && { (( RAM_MB >= 6000 )) && REASONER=on || REASONER=off; }
+CORES=$(nproc)
+info "Cores ${CORES}"
+
+# Each NLI worker holds roughly 2 GB of weights and the reasoner 5 to 9 GB
+# depending on the backend. Enabling more slots than the memory allows just
+# gets them OOM-killed mid-job.
+[[ "$REASONER" == "auto" ]] && { (( RAM_MB >= 8000 )) && REASONER=on || REASONER=off; }
 [[ "$ENSEMBLE" == "auto" ]] && { (( RAM_MB >= 3500 )) && ENSEMBLE=on || ENSEMBLE=off; }
+
+# Which backend runs slot C. ONNX Runtime through PHP FFI stops at a 4B q4
+# graph; llama.cpp has no such ceiling and is several times faster per pass,
+# but it is a second service and wants cores to be worth it.
+if [[ "$REASONER_BACKEND" == "auto" ]]; then
+    if (( RAM_MB >= 12000 && CORES >= 6 )); then
+        REASONER_BACKEND=llama
+    else
+        REASONER_BACKEND=onnx
+    fi
+fi
+[[ "$REASONER_BACKEND" == "llama" ]] || REASONER_BACKEND=onnx
+
+# The weights follow the machine: a 14B only makes sense where there are
+# cores to prefill it with, and every Run pays for ten forward passes.
+if [[ "$REASONER_BACKEND" == "llama" && -z "$LLAMA_REPO" ]]; then
+    if   (( RAM_MB >= 24000 && CORES >= 16 )); then LLAMA_REPO=Qwen/Qwen3-14B-GGUF
+    elif (( RAM_MB >= 12000 && CORES >= 6  )); then LLAMA_REPO=Qwen/Qwen3-8B-GGUF
+    else                                            LLAMA_REPO=Qwen/Qwen3-4B-GGUF
+    fi
+fi
+
+[[ -n "$LLAMA_THREADS" ]] || LLAMA_THREADS=$(( CORES > 1 ? CORES - 1 : 1 ))
 
 SLOTS=(a)
 [[ "$ENSEMBLE" == "on" ]] && SLOTS+=(b)
@@ -102,8 +138,19 @@ SLOTS=(a)
 SLOT_UNITS=()
 for s in "${SLOTS[@]}"; do SLOT_UNITS+=("george@${s}"); done
 
+USE_LLAMA=no
+[[ "$REASONER" == "on" && "$REASONER_BACKEND" == "llama" ]] && USE_LLAMA=yes
+
 info "Slots enabled: ${SLOTS[*]}"
-[[ "$REASONER" == "on" ]] || warn "Reasoner off on ${RAM_MB} MB of RAM. George stays lexical. Force with REASONER=on."
+if [[ "$REASONER" == "on" ]]; then
+    if [[ "$USE_LLAMA" == "yes" ]]; then
+        info "Slot C on llama.cpp: ${LLAMA_REPO}:${LLAMA_QUANT}, ${LLAMA_THREADS} threads"
+    else
+        info "Slot C in-process on ONNX. Force the bigger stack with REASONER_BACKEND=llama."
+    fi
+else
+    warn "Reasoner off on ${RAM_MB} MB of RAM. George stays lexical. Force with REASONER=on."
+fi
 
 # ------------------------------------------------------------ base packages --
 
@@ -333,6 +380,13 @@ set_env "$ENV_FILE" GEORGE_DRIVER queue
 set_env "$ENV_FILE" GEORGE_ENGINE auto
 set_env "$ENV_FILE" GEORGE_ENSEMBLE "$([[ "$ENSEMBLE" == "on" ]] && echo true || echo false)"
 set_env "$ENV_FILE" GEORGE_REASONER "$([[ "$REASONER" == "on" ]] && echo true || echo false)"
+set_env "$ENV_FILE" GEORGE_REASONER_BACKEND "$REASONER_BACKEND"
+if [[ "$USE_LLAMA" == "yes" ]]; then
+    set_env "$ENV_FILE" GEORGE_LLAMA_URL "http://127.0.0.1:${LLAMA_PORT}"
+    set_env "$ENV_FILE" GEORGE_LLAMA_REPO "$LLAMA_REPO"
+    set_env "$ENV_FILE" GEORGE_LLAMA_QUANT "$LLAMA_QUANT"
+    set_env "$ENV_FILE" GEORGE_LLAMA_FORMAT "$LLAMA_FORMAT"
+fi
 chown "$APP_USER:$APP_USER" "$ENV_FILE"
 chmod 640 "$ENV_FILE"
 
@@ -481,6 +535,62 @@ if [[ "$FIREWALL" != "off" ]] && command -v ufw >/dev/null 2>&1 \
     info "ufw now allows HTTP and HTTPS"
 fi
 
+# ------------------------------------------------------------------ llama.cpp --
+
+# Built from source on purpose: the release archives are per-architecture and
+# per-build-number, and a box that can run an 8B can spare the compile. Static
+# linking keeps it to one binary with no shared-library trail to maintain.
+install_llama() {
+    local src=/opt/llama.cpp
+    local bin=/usr/local/bin/llama-server
+
+    if [[ -x "$bin" ]]; then
+        info "llama-server already installed at ${bin}"
+        return 0
+    fi
+
+    step "Building llama-server"
+    info "A few minutes on ${CORES} cores. Only done once."
+
+    apt-get install -y -qq --no-install-recommends \
+        build-essential cmake libcurl4-openssl-dev >/dev/null
+
+    if [[ -d "$src/.git" ]]; then
+        git -C "$src" fetch --depth 1 origin master >/dev/null 2>&1
+        git -C "$src" reset --hard FETCH_HEAD >/dev/null 2>&1
+    else
+        rm -rf "$src"
+        git clone --depth 1 https://github.com/ggml-org/llama.cpp "$src" >/dev/null 2>&1 \
+            || { warn "Could not clone llama.cpp."; return 1; }
+    fi
+
+    # LLAMA_CURL is what makes -hf able to fetch its own GGUF.
+    cmake -S "$src" -B "$src/build" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DLLAMA_CURL=ON \
+        -DLLAMA_BUILD_TESTS=OFF \
+        -DLLAMA_BUILD_EXAMPLES=OFF >/dev/null 2>&1 \
+        || { warn "cmake configure failed."; return 1; }
+
+    cmake --build "$src/build" --target llama-server -j "$CORES" >/dev/null 2>&1 \
+        || { warn "llama-server did not build."; return 1; }
+
+    install -m 0755 "$src/build/bin/llama-server" "$bin" || return 1
+    info "llama-server installed at ${bin}"
+}
+
+if [[ "$USE_LLAMA" == "yes" ]]; then
+    if ! install_llama; then
+        warn "Falling back to the in-process ONNX reasoner."
+        USE_LLAMA=no
+        REASONER_BACKEND=onnx
+        set_env "$ENV_FILE" GEORGE_REASONER_BACKEND onnx
+        # The config cache was warmed before this point and still says llama.
+        as_app "$PHP_BIN" artisan config:cache >/dev/null
+    fi
+fi
+
 # ------------------------------------------------------------------ services --
 
 step "Installing the services"
@@ -510,6 +620,60 @@ Nice=5
 [Install]
 WantedBy=multi-user.target
 UNIT
+
+LLAMA_MODELS_DIR="${APP_DIR}/storage/app/llama-models"
+
+if [[ "$USE_LLAMA" == "yes" ]]; then
+    mkdir -p "$LLAMA_MODELS_DIR"
+    chown -R "$APP_USER:$APP_USER" "$LLAMA_MODELS_DIR"
+
+    # llama-server pulls its own GGUF on first boot and holds it in memory
+    # from then on. --parallel 1 keeps a single KV cache, so the primer and
+    # the situation stay cached across the conditions of a Run.
+    cat >/etc/systemd/system/george-llama.service <<UNIT
+# TryGeorge — managed by deploy/install.sh
+[Unit]
+Description=TryGeorge reasoner (llama.cpp), ${LLAMA_REPO}:${LLAMA_QUANT}
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=${APP_USER}
+Group=${APP_USER}
+WorkingDirectory=${APP_DIR}
+Environment=HOME=${APP_DIR}
+Environment=LLAMA_CACHE=${LLAMA_MODELS_DIR}
+ExecStart=/usr/local/bin/llama-server \\
+    --host 127.0.0.1 --port ${LLAMA_PORT} \\
+    -hf ${LLAMA_REPO}:${LLAMA_QUANT} \\
+    --ctx-size ${LLAMA_CTX} --threads ${LLAMA_THREADS} \\
+    --parallel 1 --cache-reuse 256
+Restart=always
+RestartSec=10
+TimeoutStartSec=0
+Nice=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+    # Slot C is useless before the server answers, and systemd should bring
+    # them up in that order after a reboot.
+    mkdir -p /etc/systemd/system/george@c.service.d
+    cat >/etc/systemd/system/george@c.service.d/llama.conf <<'UNIT'
+# TryGeorge — managed by deploy/install.sh
+[Unit]
+After=george-llama.service
+Wants=george-llama.service
+UNIT
+else
+    rm -f /etc/systemd/system/george@c.service.d/llama.conf
+    systemctl disable --now george-llama >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/george-llama.service
+fi
 
 # Several GB of weights. Downloading them from a unit rather than inline means
 # the installer returns quickly and the transfer survives the SSH session.
@@ -562,6 +726,12 @@ WantedBy=timers.target
 UNIT
 
 systemctl daemon-reload
+
+if [[ "$USE_LLAMA" == "yes" ]]; then
+    systemctl enable george-llama >/dev/null 2>&1
+    systemctl restart george-llama
+    info "llama-server starting on 127.0.0.1:${LLAMA_PORT}; it fetches ${LLAMA_REPO}:${LLAMA_QUANT} on first boot"
+fi
 
 # Drop slot units left over from a run that had more slots enabled.
 for old in a b c; do
@@ -676,6 +846,17 @@ info "Engine status: ${STATUS_JSON}"
 
 SCHEME=http
 [[ "$TLS_OK" == "yes" ]] && SCHEME=https
+
+LLAMA_SUMMARY=""
+if [[ "$REASONER" != "on" ]]; then
+    REASONER_SUMMARY="off — George stays lexical"
+elif [[ "$USE_LLAMA" == "yes" ]]; then
+    REASONER_SUMMARY="llama.cpp, ${LLAMA_REPO}:${LLAMA_QUANT}, ${LLAMA_THREADS} threads"
+    LLAMA_SUMMARY="
+   Reasoner logs       journalctl -fu george-llama"
+else
+    REASONER_SUMMARY="onnx, in-process"
+fi
 RAW_URL="$(sed -e 's#^https://github.com/#https://raw.githubusercontent.com/#' -e 's#\.git$##' <<<"$REPO")/${BRANCH}/deploy/install.sh"
 
 cat <<SUMMARY
@@ -687,13 +868,15 @@ $(printf '\033[1;32m✓\033[0m') TryGeorge is installed.
    PHP         ${PHP_VER}, FFI on, CLI memory_limit 4096M
    Database    SQLite at ${APP_DIR}/database/database.sqlite
    Slots       ${SLOTS[*]}
+   Reasoner    ${REASONER_SUMMARY}
 
    The models are still downloading. Until they land the page answers with the
    keyword heuristic and shows a banner saying so.
 
    Download progress   journalctl -fu george-models
    Worker logs         journalctl -fu 'george@*'
-   Restart workers     systemctl restart ${SLOT_UNITS[*]}
+   Restart workers     systemctl restart ${SLOT_UNITS[*]}${LLAMA_SUMMARY}
+   Measure the slot    cd ${APP_DIR} && sudo -u ${APP_USER} ${PHP_BIN} artisan george:bench
    Update the app      curl -fsSL ${RAW_URL} | sudo bash
 
 SUMMARY

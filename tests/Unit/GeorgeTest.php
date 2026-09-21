@@ -8,6 +8,7 @@ use App\George\Reasoners\FakeReasoner;
 use App\George\Support\Distributions;
 use App\George\Support\Hypotheses;
 use App\George\Support\Language;
+use App\George\Support\Primer;
 use App\George\Support\Prompt;
 use App\George\Support\Softmax;
 use App\George\Support\TemperatureScaler;
@@ -227,6 +228,21 @@ it('renders a chatml prompt with lettered options and no thinking', function () 
         ->toContain("A. Yes. Down\nB. No. Fine")
         ->toContain('Answer with the letter only.')
         ->and($chat)->toStartWith("<|im_start|>system\n")
+        ->toEndWith("<|im_start|>assistant\n<think>\n\n</think>\n\n");
+});
+
+it('teaches the reasoner with completed few-shot turns', function () {
+    $user = Prompt::user('Production is down.', 'Page someone?', ['Yes. Down', 'No. Fine']);
+    $chat = Prompt::chat(Primer::system(), $user, 'chatml', Primer::shots());
+
+    expect(Primer::system())->toContain('lookalike sender')
+        ->and(Primer::shots())->toHaveCount(3)
+        ->and($chat)->toContain('roofworks-inc.com')
+        ->toContain("<|im_start|>assistant\nB<|im_end|>")
+        ->toContain('search cluster reindex')
+        ->not->toContain('print supplier')
+        ->not->toContain('48,000')
+        ->not->toContain('Northwind')
         ->toEndWith("<|im_start|>assistant\n<think>\n\n</think>\n\n");
 });
 

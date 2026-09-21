@@ -7,6 +7,7 @@ use App\George\Contracts\Reasoner;
 use App\George\Engines\FakeEngine;
 use App\George\Engines\TransformersEngine;
 use App\George\Reasoners\FakeReasoner;
+use App\George\Reasoners\LlamaReasoner;
 use App\George\Reasoners\TransformersReasoner;
 
 /**
@@ -35,13 +36,28 @@ final class EngineFactory
 
     public function makeReasoner(): Reasoner
     {
-        return $this->reasoner ??= match (config('george.engine')) {
-            'fake' => new FakeReasoner,
-            'transformers' => new TransformersReasoner,
-            default => TransformersReasoner::modelIsCached()
-                ? new TransformersReasoner
-                : new FakeReasoner,
-        };
+        return $this->reasoner ??= $this->buildReasoner();
+    }
+
+    /**
+     * Slot C runs either in this process (ONNX) or against llama-server,
+     * and falls back to the heuristic when its backend is not there.
+     */
+    private function buildReasoner(): Reasoner
+    {
+        if (config('george.engine') === 'fake') {
+            return new FakeReasoner;
+        }
+
+        $reasoner = Ensemble::reasonerBackend() === 'llama'
+            ? new LlamaReasoner
+            : new TransformersReasoner;
+
+        if (config('george.engine') === 'transformers') {
+            return $reasoner;
+        }
+
+        return $reasoner->isReady() ? $reasoner : new FakeReasoner;
     }
 
     public function forget(): void
