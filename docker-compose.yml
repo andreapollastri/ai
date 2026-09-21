@@ -1,0 +1,72 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      APP_ENV: production
+      APP_DEBUG: "false"
+      GEORGE_ENGINE: transformers
+      GEORGE_DRIVER: queue
+      GEORGE_ENSEMBLE: "true"
+      QUEUE_CONNECTION: database
+    volumes:
+      - george-models:/app/storage/app/george-models
+      - george-db:/app/database
+    command: >
+      sh -c "php artisan migrate --force &&
+             php artisan george:download --no-interaction &&
+             php artisan serve --host=0.0.0.0 --port=8000"
+
+  worker-a:
+    build: .
+    environment:
+      APP_ENV: production
+      APP_DEBUG: "false"
+      GEORGE_ENGINE: transformers
+      GEORGE_DRIVER: queue
+      GEORGE_ENSEMBLE: "true"
+      QUEUE_CONNECTION: database
+    volumes:
+      - george-models:/app/storage/app/george-models
+      - george-db:/app/database
+    command: php artisan george:work --slot=a --memory=2048 --timeout=180
+    depends_on:
+      - app
+
+  worker-b:
+    build: .
+    environment:
+      APP_ENV: production
+      APP_DEBUG: "false"
+      GEORGE_ENGINE: transformers
+      GEORGE_DRIVER: queue
+      GEORGE_ENSEMBLE: "true"
+      QUEUE_CONNECTION: database
+    volumes:
+      - george-models:/app/storage/app/george-models
+      - george-db:/app/database
+    command: php artisan george:work --slot=b --memory=2048 --timeout=180
+    depends_on:
+      - app
+
+  worker-c:
+    build: .
+    environment:
+      APP_ENV: production
+      APP_DEBUG: "false"
+      GEORGE_ENGINE: transformers
+      GEORGE_DRIVER: queue
+      GEORGE_ENSEMBLE: "true"
+      GEORGE_REASONER: "true"
+      QUEUE_CONNECTION: database
+    volumes:
+      - george-models:/app/storage/app/george-models
+      - george-db:/app/database
+    command: php artisan george:work --slot=c --memory=4096 --timeout=180
+    depends_on:
+      - app
+
+volumes:
+  george-models:
+  george-db:

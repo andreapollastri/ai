@@ -1,0 +1,10 @@
+/vendor
+/node_modules
+/.env
+/storage/app/george-models
+*.sqlite
+.dockerignore
+.git
+.gitattributes
+.github
+tests
